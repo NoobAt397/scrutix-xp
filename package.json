@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-slot": "^1.2.4",
     "@radix-ui/react-toast": "^1.2.15",
@@ -21,6 +22,7 @@
     "papaparse": "^5.5.3",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "recharts": "^2.15.4",
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {
