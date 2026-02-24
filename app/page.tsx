@@ -1,7 +1,7 @@
 "use client"
 
-import { useState, useMemo } from "react"
-import { ChevronDown, UploadCloud, FileText, X } from "lucide-react"
+import { useState, useMemo, useEffect } from "react"
+import { ChevronDown, UploadCloud, FileText, X, Download } from "lucide-react"
 import Papa from "papaparse"
 import { PieChart, Pie, Cell, Label } from "recharts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -23,8 +23,28 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart"
 import { analyzeInvoice, type AnalysisResult, type ContractRules, type Discrepancy } from "@/lib/billing-engine"
+import { detectColumns, REQUIRED_CANONICAL, type DetectionResult } from "@/lib/column-matcher"
+import { findHeaderRow, normalizeRows, applyMapping } from "@/lib/csv-normalizer"
 import { useToast } from "@/hooks/use-toast"
 import EvidenceModal from "@/components/EvidenceModal"
+import ColumnMappingModal from "@/components/ColumnMappingModal"
+import PDFPreviewModal from "@/components/PDFPreviewModal"
+import type { ExtractionSource } from "@/app/api/extract-invoice/route"
+import {
+  buildAuditRecord,
+  saveAuditRecord,
+  loadAuditHistory,
+  clearAuditHistory,
+  type AuditRecord,
+} from "@/lib/audit-history"
+import AnalyticsDashboard from "@/components/AnalyticsDashboard"
+import { exportPayoutExcel } from "@/lib/excel-export"
+import {
+  storeWeightData,
+  loadWeightData,
+  clearWeightData,
+  type WeightDataPoint,
+} from "@/lib/weight-regression"
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -65,13 +85,33 @@ export default function Home() {
   const [contractOpen, setContractOpen] = useState(true)
   const [selectedDiscrepancy, setSelectedDiscrepancy] = useState<Discrepancy | null>(null)
   const [currentPage, setCurrentPage] = useState(0)
+  // Column mapping modal state
+  const [pendingRawHeaders, setPendingRawHeaders] = useState<string[]>([])
+  const [pendingRawRows, setPendingRawRows] = useState<Record<string, unknown>[] | null>(null)
+  const [pendingDetection, setPendingDetection] = useState<DetectionResult | null>(null)
+  const [analysisWarnings, setAnalysisWarnings] = useState<string[]>([])
+  // PDF invoice preview state
+  const [pendingPdfPreview, setPendingPdfPreview] = useState<{
+    rows: Record<string, unknown>[]
+    source: ExtractionSource
+    pageCount: number
+    fileName: string
+  } | null>(null)
+  const [isPdfExtracting, setIsPdfExtracting] = useState(false)
+  // Tab + analytics history
+  const [activeTab, setActiveTab] = useState<"audit" | "analytics">("audit")
+  const [auditHistory, setAuditHistory] = useState<AuditRecord[]>([])
+  const [weightData, setWeightData] = useState<WeightDataPoint[]>([])
+  // Full normalized rows from most recent audit (needed for Excel export Sheet 2 & 3)
+  const [lastMappedRows, setLastMappedRows] = useState<Record<string, unknown>[]>([])
+
+  // Load history from localStorage on client mount
+  useEffect(() => {
+    setAuditHistory(loadAuditHistory())
+    setWeightData(loadWeightData())
+  }, [])
 
   const PAGE_SIZE = 50
-
-  const REQUIRED_COLUMNS = [
-    "AWB", "OrderType", "BilledWeight", "ActualWeight",
-    "BilledZone", "ActualZone", "TotalBilledAmount",
-  ] as const
 
   // ── Derived chart data ──────────────────────────────────────────────────────
   // Aggregate total overcharge (₹) per issue type.
@@ -112,134 +152,225 @@ export default function Home() {
 
   // ── Handlers ────────────────────────────────────────────────────────────────
 
-  function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  // ── Core analysis runner (shared by auto + manual mapping paths) ─────────────
+  // fileNameHint: pass file.name when calling synchronously from the same event
+  // handler as setFileName (React state batching means fileName won't be updated yet).
+  function runAnalysis(mappedRows: Record<string, unknown>[], fileNameHint?: string) {
+    // Build warnings for missing optional columns
+    const warnings: string[] = []
+    const first = mappedRows[0] ?? {}
+    if (!("Length" in first) || !("Width" in first) || !("Height" in first)) {
+      warnings.push("Volumetric weight check skipped — no dimension columns (Length, Width, Height) found.")
+    }
+    if (!("OriginPincode" in first) || !("DestPincode" in first)) {
+      warnings.push("Pincode zone validation skipped — OriginPincode / DestPincode not detected.")
+    }
+    setAnalysisWarnings(warnings)
+
+    const analysis = analyzeInvoice(mappedRows as any[], activeContract)
+    setAnalysisResults(analysis)
+    setLastMappedRows(mappedRows)
+    setCurrentPage(0)
+    setIsProcessing(false)
+
+    // Persist this audit run to analytics history
+    const record = buildAuditRecord({
+      analysisResult: analysis,
+      providerName:   activeContract.provider_name,
+      fileName:       fileNameHint ?? fileName ?? "unknown",
+    })
+    saveAuditRecord(record)
+    setAuditHistory((prev) => [...prev, record])
+
+    // ── Weight regression data collection ─────────────────────────────────────
+    // Canonical fields from normalizeRows are in kg; convert to grams for storage
+    const provider = activeContract.provider_name
+    const now = Date.now()
+    const newWeightPoints: WeightDataPoint[] = []
+    for (const row of mappedRows) {
+      const declared = Number(row["ActualWeight"] ?? 0)
+      const billed   = Number(row["BilledWeight"]  ?? 0)
+      const awb      = String(row["AWB"] ?? "")
+      if (declared > 0 && billed > 0 && awb) {
+        newWeightPoints.push({
+          provider,
+          awb,
+          declaredWeight_g: Math.round(declared * 1000),
+          billedWeight_g:   Math.round(billed   * 1000),
+          date: now,
+        })
+      }
+    }
+    if (newWeightPoints.length > 0) {
+      storeWeightData(newWeightPoints)
+      setWeightData((prev) => [...prev, ...newWeightPoints])
+    }
+  }
+
+  // ── Called when user confirms mapping in the modal ────────────────────────
+  function handleMappingConfirm(confirmedMapping: Record<string, string | null>) {
+    if (!pendingRawRows) return
+    setPendingDetection(null)
+
+    setIsProcessing(true)
+    const mapped    = applyMapping(pendingRawRows, confirmedMapping)
+    const finalRows = normalizeRows(mapped)
+    setPendingRawRows(null)
+
+    if (finalRows.length === 0) {
+      toast({
+        variant: "destructive",
+        title: "No Valid Rows",
+        description: "No rows contained both AWB and Total Billed Amount after mapping.",
+      })
+      setFileName(null)
+      setIsProcessing(false)
+      return
+    }
+
+    toast({
+      title: "Columns confirmed. Auditing…",
+      description: `${finalRows.length} rows ready.`,
+    })
+    runAnalysis(finalRows)
+  }
+
+  // ── File upload entry point ────────────────────────────────────────────────
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
+    // Reset input so the same file can be re-selected
+    e.target.value = ""
+
+    // Route PDF invoice files to the dedicated handler
+    if (file.name.toLowerCase().endsWith(".pdf") || file.type === "application/pdf") {
+      await handleInvoicePdfUpload(file)
+      return
+    }
 
     setFileName(file.name)
     setIsProcessing(true)
+    setAnalysisResults(null)
+    setAnalysisWarnings([])
 
-    Papa.parse(file, {
-      header: true,
-      dynamicTyping: true,
-      skipEmptyLines: true,
-      complete: async (results) => {
-        const rows = results.data as Record<string, unknown>[]
+    try {
+      // ── 1. Parse file to raw string arrays (CSV or XLSX) ──────────────────
+      let rawArrays: string[][]
 
-        if (rows.length === 0) {
-          setIsProcessing(false)
-          return
-        }
-
-        const firstRow = rows[0] ?? {}
-        const rawHeaders = Object.keys(firstRow)
-
-        // ── Fast path: headers already match the standard schema ──
-        const alreadyStandard = REQUIRED_COLUMNS.every((col) => col in firstRow)
-
-        let normalizedRows: Record<string, unknown>[]
-
-        if (alreadyStandard) {
-          normalizedRows = rows
-        } else {
-          // ── AI normalisation path ──
-          const { id, update } = toast({
-            title: "AI analyzing CSV column structure…",
-            description: `Detected ${rawHeaders.length} column${rawHeaders.length !== 1 ? "s" : ""}: ${rawHeaders.join(", ")}`,
+      if (file.name.endsWith(".xlsx") || file.name.endsWith(".xls")) {
+        // SheetJS — dynamic import to keep initial bundle lean
+        const XLSX = await import("xlsx")
+        const buffer = await file.arrayBuffer()
+        const wb    = XLSX.read(new Uint8Array(buffer), { type: "array" })
+        const sheet = wb.Sheets[wb.SheetNames[0]]
+        rawArrays   = XLSX.utils.sheet_to_json(sheet, {
+          header: 1,
+          defval: "",
+          raw:    false,
+        }) as string[][]
+      } else {
+        // PapaParse with auto-delimiter detection
+        rawArrays = await new Promise<string[][]>((resolve, reject) => {
+          Papa.parse(file, {
+            header:        false,
+            delimiter:     "",        // auto-detect: comma, semicolon, tab
+            dynamicTyping: false,     // keep strings; normalizers handle conversion
+            skipEmptyLines: true,
+            complete: (r) => resolve(r.data as string[][]),
+            error:    (err) => reject(err),
           })
+        })
+      }
 
-          let mapping: Record<string, string | null>
-          try {
-            const res = await fetch("/api/map-headers", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ rawHeaders }),
-            })
-
-            if (!res.ok) throw new Error("mapping API error")
-            mapping = await res.json()
-          } catch {
-            update({
-              id,
-              variant: "destructive",
-              title: "Column Mapping Failed",
-              description:
-                "AI could not map the CSV headers. Please rename columns to the standard format.",
-            })
-            setAnalysisResults(null)
-            setFileName(null)
-            setIsProcessing(false)
-            return
-          }
-
-          // Remap each row's keys to standard names
-          normalizedRows = rows.map((row) => {
-            const normalized: Record<string, unknown> = {}
-            for (const [rawKey, value] of Object.entries(row)) {
-              const standardKey = mapping[rawKey]
-              if (standardKey) normalized[standardKey] = value
-            }
-            return normalized
-          })
-
-          // Drop rows where the two critical fields are absent (prevents NaNs)
-          normalizedRows = normalizedRows.filter(
-            (row) => row.AWB != null && row.TotalBilledAmount != null
-          )
-
-          update({
-            id,
-            title: "Columns mapped. Auditing invoice…",
-            description: `${normalizedRows.length} valid rows ready for analysis.`,
-          })
-        }
-
-        // ── Post-normalisation guard ──
-        const missingColumns = REQUIRED_COLUMNS.filter(
-          (col) => !(col in (normalizedRows[0] ?? {}))
-        )
-
-        if (missingColumns.length > 0 || normalizedRows.length === 0) {
-          toast({
-            variant: "destructive",
-            title: "Invalid CSV Format",
-            description:
-              "Please upload a standard Logistics Invoice with the correct columns.",
-          })
-          setAnalysisResults(null)
-          setFileName(null)
-          setIsProcessing(false)
-          return
-        }
-
-        const analysis = analyzeInvoice(normalizedRows as any[], activeContract)
-        setAnalysisResults(analysis)
-        setCurrentPage(0)
+      if (rawArrays.length < 2) {
+        toast({ variant: "destructive", title: "Empty File", description: "The file contains no data rows." })
+        setFileName(null)
         setIsProcessing(false)
-      },
-      error: () => setIsProcessing(false),
-    })
+        return
+      }
+
+      // ── 2. Multi-row header detection ─────────────────────────────────────
+      const headerIdx = findHeaderRow(rawArrays)
+      const headers   = rawArrays[headerIdx].map((h) => String(h ?? "").trim()).filter(Boolean)
+      const dataRows  = rawArrays.slice(headerIdx + 1)
+
+      // Build objects from detected header row
+      const rawRows: Record<string, unknown>[] = dataRows
+        .map((row) => {
+          const obj: Record<string, unknown> = {}
+          headers.forEach((h, i) => { obj[h] = row[i] ?? null })
+          return obj
+        })
+        .filter((row) => Object.values(row).some((v) => v !== null && v !== ""))
+
+      if (rawRows.length === 0) {
+        toast({ variant: "destructive", title: "No Data", description: "Could not find any data rows after detecting the header." })
+        setFileName(null)
+        setIsProcessing(false)
+        return
+      }
+
+      // ── 3. Fast path: headers already match standard schema ───────────────
+      const alreadyStandard = REQUIRED_CANONICAL.every((col) => col in rawRows[0])
+      if (alreadyStandard) {
+        runAnalysis(normalizeRows(rawRows), file.name)
+        return
+      }
+
+      // ── 4. Fuzzy column detection ─────────────────────────────────────────
+      const detection = detectColumns(headers)
+
+      if (!detection.needsManualReview) {
+        // All required fields detected with ≥ 80% confidence — apply silently
+        const mapped    = applyMapping(rawRows, detection.mapping)
+        const finalRows = normalizeRows(mapped)
+
+        if (finalRows.length > 0) {
+          toast({
+            title: "Columns auto-mapped",
+            description: `${headers.length} columns mapped with high confidence.`,
+          })
+          runAnalysis(finalRows, file.name)
+          return
+        }
+      }
+
+      // ── 5. Low confidence → show ColumnMappingModal ───────────────────────
+      setPendingRawHeaders(headers)
+      setPendingRawRows(rawRows)
+      setPendingDetection(detection)
+      setIsProcessing(false)
+
+    } catch (err) {
+      console.error("[handleFileUpload]", err)
+      toast({
+        variant: "destructive",
+        title: "File Read Error",
+        description: "Could not parse the file. Please check it is a valid CSV or Excel file.",
+      })
+      setFileName(null)
+      setIsProcessing(false)
+    }
   }
 
-  function handleExport() {
-    if (!analysisResults?.discrepancies.length) return
-
-    const headers = ["AWB Number", "Issue Type", "Billed Amount", "Correct Amount", "Difference"]
-    const rows = analysisResults.discrepancies.map((d) => [
-      d.awb_number,
-      d.issue_type,
-      d.billed_amount.toFixed(2),
-      d.correct_amount.toFixed(2),
-      d.difference.toFixed(2),
-    ])
-    const csv = [headers, ...rows].map((r) => r.join(",")).join("\n")
-    const blob = new Blob([csv], { type: "text/csv" })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = "mosaic-discrepancy-payout.csv"
-    a.click()
-    URL.revokeObjectURL(url)
+  async function handleExport() {
+    if (!analysisResults) return
+    try {
+      const disputeCount = await exportPayoutExcel({
+        analysisResult: analysisResults,
+        mappedRows:     lastMappedRows,
+        providerName:   activeContract.provider_name,
+      })
+      toast({
+        title: "Payout file exported",
+        description: disputeCount > 0
+          ? `${disputeCount} dispute${disputeCount !== 1 ? "s" : ""} ready to send`
+          : "All charges verified — no disputes found",
+      })
+    } catch (err) {
+      console.error("[handleExport]", err)
+      toast({ variant: "destructive", title: "Export Failed", description: "Could not generate the Excel file." })
+    }
   }
 
   async function handlePdfUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -284,6 +415,106 @@ export default function Home() {
     } finally {
       setIsExtracting(false)
     }
+  }
+
+  // ── Invoice PDF upload (separate from contract PDF upload) ─────────────────
+  async function handleInvoicePdfUpload(file: File) {
+    setFileName(file.name)
+    setIsProcessing(false)
+    setIsPdfExtracting(true)
+    setAnalysisResults(null)
+    setAnalysisWarnings([])
+
+    const { id, update } = toast({
+      title: "Reading PDF invoice…",
+      description: `Extracting table data from ${file.name}`,
+    })
+
+    try {
+      const form = new FormData()
+      form.append("file", file)
+
+      const res = await fetch("/api/extract-invoice", {
+        method: "POST",
+        body: form,
+      })
+
+      if (!res.ok) throw new Error("extraction failed")
+
+      const data = await res.json() as {
+        rows: Record<string, unknown>[]
+        source: ExtractionSource
+        pageCount: number
+      }
+
+      if (!data.rows || data.rows.length === 0) {
+        update({
+          id,
+          variant: "destructive",
+          title: "No Rows Found",
+          description: "Could not extract any table rows from this PDF.",
+        })
+        setFileName(null)
+        return
+      }
+
+      update({
+        id,
+        title: "Invoice Extracted",
+        description: `${data.rows.length} rows found via ${data.source === "ai" ? "Gemini AI" : "text extraction"}. Review before auditing.`,
+      })
+
+      setPendingPdfPreview({ rows: data.rows, source: data.source, pageCount: data.pageCount, fileName: file.name })
+    } catch {
+      update({
+        id,
+        variant: "destructive",
+        title: "Extraction Failed",
+        description: "Could not parse the PDF. Try a text-based PDF or a CSV export.",
+      })
+      setFileName(null)
+    } finally {
+      setIsPdfExtracting(false)
+    }
+  }
+
+  // ── Called when user confirms PDF preview and clicks "Run Audit" ────────────
+  function handlePdfPreviewConfirm(rows: Record<string, unknown>[], source: ExtractionSource) {
+    setPendingPdfPreview(null)
+    setIsProcessing(true)
+
+    if (source === "ai") {
+      // Gemini has already normalised field names — run directly
+      runAnalysis(normalizeRows(rows))
+      return
+    }
+
+    // Text-extracted rows have raw header names — run through column detection
+    const headers = Object.keys(rows[0] ?? {})
+    const alreadyStandard = REQUIRED_CANONICAL.every((col) => col in (rows[0] ?? {}))
+
+    if (alreadyStandard) {
+      runAnalysis(normalizeRows(rows))
+      return
+    }
+
+    const detection = detectColumns(headers)
+
+    if (!detection.needsManualReview) {
+      const mapped = applyMapping(rows, detection.mapping)
+      const finalRows = normalizeRows(mapped)
+      if (finalRows.length > 0) {
+        toast({ title: "Columns auto-mapped", description: `${headers.length} columns detected.` })
+        runAnalysis(finalRows)
+        return
+      }
+    }
+
+    // Low confidence — show mapping modal
+    setPendingRawHeaders(headers)
+    setPendingRawRows(rows)
+    setPendingDetection(detection)
+    setIsProcessing(false)
   }
 
   // ── Derived booleans + pagination ──────────────────────────────────────────
@@ -337,6 +568,34 @@ export default function Home() {
           </p>
         </header>
 
+        {/* ── Tab navigation ── */}
+        <div className="flex items-center gap-0 border-b border-zinc-800/40 -mb-1">
+          {(["audit", "analytics"] as const).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className="relative px-5 py-2.5 text-xs font-medium uppercase tracking-widest transition-colors"
+              style={{ color: activeTab === tab ? "rgb(212,212,216)" : "rgb(82,82,91)" }}
+            >
+              {tab === "audit" ? "Audit" : "Analytics"}
+              {activeTab === tab && (
+                <span
+                  className="absolute bottom-0 left-0 right-0 h-px"
+                  style={{ background: "rgb(239,68,68)" }}
+                />
+              )}
+            </button>
+          ))}
+          {auditHistory.length > 0 && (
+            <span className="ml-auto text-[10px] text-zinc-700 pr-2 tabular-nums">
+              {auditHistory.length} audit{auditHistory.length !== 1 ? "s" : ""} tracked
+            </span>
+          )}
+        </div>
+
+        {/* ── Audit Tab Content ── */}
+        {activeTab === "audit" && (<>
+
         {/* ── Upload + Contract Rules row ── */}
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-4 items-start">
 
@@ -344,7 +603,7 @@ export default function Home() {
           <Card className="bg-zinc-950 border border-zinc-800/70 shadow-none">
             <CardHeader className="pb-2">
               <CardTitle className="text-[11px] text-zinc-500 font-semibold uppercase tracking-widest">
-                Upload Invoice CSV
+                Upload Invoice
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
@@ -361,31 +620,31 @@ export default function Home() {
                 />
                 <div className="text-center space-y-1">
                   <p className="text-sm font-medium text-zinc-400 group-hover:text-zinc-300 transition-colors">
-                    {fileName && !isProcessing
+                    {fileName && !isProcessing && !isPdfExtracting
                       ? fileName
-                      : "Click to upload Invoice CSV"}
+                      : isPdfExtracting
+                      ? "Extracting PDF…"
+                      : "Click to upload Invoice"}
                   </p>
                   <p className="text-[11px] text-zinc-600">
-                    Required:&nbsp;
-                    <span className="font-mono">AWB, OrderType, BilledWeight, ActualWeight, BilledZone, ActualZone, TotalBilledAmount</span>
+                    CSV, XLSX, PDF · comma / semicolon / tab delimiters · multi-row headers auto-skipped
                   </p>
                   <p className="text-[11px] text-zinc-700 mt-0.5">
-                    Optional:&nbsp;
-                    <span className="font-mono">Length, Width, Height (cm), OriginPincode, DestPincode</span>
+                    Columns auto-detected · scanned PDFs parsed by Gemini AI
                   </p>
                 </div>
                 <Input
                   type="file"
-                  accept=".csv"
+                  accept=".csv,.xlsx,.xls,.pdf"
                   onChange={handleFileUpload}
                   className="hidden"
                 />
               </label>
 
-              {isProcessing && (
+              {(isProcessing || isPdfExtracting) && (
                 <p className="text-xs text-red-400 animate-pulse flex items-center gap-2">
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500 animate-ping" />
-                  Analyzing {fileName}…
+                  {isPdfExtracting ? `Extracting ${fileName}…` : `Analyzing ${fileName}…`}
                 </p>
               )}
               {!isProcessing && fileName && analysisResults && (
@@ -800,13 +1059,13 @@ export default function Home() {
               </div>
               <Button
                 onClick={handleExport}
-                disabled={analysisResults.discrepancies.length === 0}
                 size="sm"
                 className="disabled:opacity-30 text-white border-0 text-xs tracking-wide h-8 px-4
-                           hover:opacity-90 transition-opacity"
+                           hover:opacity-90 transition-opacity flex items-center gap-1.5"
                 style={{ backgroundColor: "#1F4D3F" }}
               >
-                Download Payout File
+                <Download size={12} />
+                Export Payout File
               </Button>
             </CardHeader>
 
@@ -915,8 +1174,21 @@ export default function Home() {
           </Card>
         )}
 
+        {/* ── Analysis warnings (missing optional columns) ── */}
+        {analysisResults && analysisWarnings.length > 0 && (
+          <div className="rounded-md border border-amber-900/30 px-4 py-2.5 space-y-1"
+               style={{ background: "rgba(120,53,15,0.08)" }}>
+            {analysisWarnings.map((w, i) => (
+              <p key={i} className="text-[11px] text-amber-600 flex items-start gap-2">
+                <span className="flex-shrink-0 mt-px">⚠</span>
+                {w}
+              </p>
+            ))}
+          </div>
+        )}
+
         {/* ── Empty state ── */}
-        {!analysisResults && !isProcessing && (
+        {!analysisResults && !isProcessing && !isPdfExtracting && !pendingDetection && !pendingPdfPreview && (
           <div className="flex flex-col items-center justify-center py-28 space-y-4">
             <div
               className="w-16 h-16 rounded-full border border-zinc-800 flex items-center justify-center"
@@ -924,8 +1196,43 @@ export default function Home() {
             >
               <div className="w-5 h-5 rounded-full bg-red-950/70" />
             </div>
-            <p className="text-zinc-600 text-sm">Upload a CSV file to begin the audit</p>
+            <p className="text-zinc-600 text-sm">Upload a CSV, XLSX, or PDF invoice to begin the audit</p>
           </div>
+        )}
+
+        </>)}
+
+        {/* ── Analytics Tab Content ── */}
+        {activeTab === "analytics" && (
+          <>
+            {/* Re-export button — visible when a recent audit exists */}
+            {analysisResults && lastMappedRows.length > 0 && (
+              <div className="flex items-center justify-between">
+                <p className="text-[11px] text-zinc-600">
+                  Most recent audit: <span className="text-zinc-400 font-mono">{fileName ?? "—"}</span>
+                </p>
+                <Button
+                  onClick={handleExport}
+                  size="sm"
+                  className="text-white border-0 text-xs tracking-wide h-8 px-4 hover:opacity-90 transition-opacity flex items-center gap-1.5"
+                  style={{ backgroundColor: "#1F4D3F" }}
+                >
+                  <Download size={12} />
+                  Export Payout File
+                </Button>
+              </div>
+            )}
+
+            <AnalyticsDashboard
+              records={auditHistory}
+              weightData={weightData}
+              onClear={() => {
+                clearWeightData()
+                setWeightData([])
+                setAuditHistory([])
+              }}
+            />
+          </>
         )}
 
         {/* ── Footer ── */}
@@ -934,12 +1241,41 @@ export default function Home() {
         </p>
       </div>
 
-      {/* ── Evidence Modal (portal-style fixed overlay) ── */}
+      {/* ── Evidence Modal ── */}
       {selectedDiscrepancy && (
         <EvidenceModal
           discrepancy={selectedDiscrepancy}
           gstPercentage={activeContract.gst_percentage}
           onClose={() => setSelectedDiscrepancy(null)}
+        />
+      )}
+
+      {/* ── Column Mapping Modal ── */}
+      {pendingDetection && pendingRawRows && (
+        <ColumnMappingModal
+          rawHeaders={pendingRawHeaders}
+          detection={pendingDetection}
+          onConfirm={handleMappingConfirm}
+          onClose={() => {
+            setPendingDetection(null)
+            setPendingRawRows(null)
+            setFileName(null)
+          }}
+        />
+      )}
+
+      {/* ── PDF Invoice Preview Modal ── */}
+      {pendingPdfPreview && (
+        <PDFPreviewModal
+          rows={pendingPdfPreview.rows}
+          source={pendingPdfPreview.source}
+          pageCount={pendingPdfPreview.pageCount}
+          fileName={pendingPdfPreview.fileName}
+          onConfirm={handlePdfPreviewConfirm}
+          onClose={() => {
+            setPendingPdfPreview(null)
+            setFileName(null)
+          }}
         />
       )}
     </div>
