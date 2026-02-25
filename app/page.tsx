@@ -750,9 +750,9 @@ export default function Home() {
             <Image
               src="/scrutixxp-logo.png"
               alt="Scrutix-XP"
-              width={0}
-              height={32}
-              style={{ width: "auto", height: "32px", filter: "brightness(0) invert(1)" }}
+              width={200}
+              height={48}
+              style={{ height: "48px", width: "auto", minWidth: "120px", filter: "brightness(0) invert(1)" }}
               priority
             />
           </div>
