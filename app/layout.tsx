@@ -3,7 +3,7 @@ import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
 export const metadata: Metadata = {
-  title: "Scrutix — Logistics Invoice Auditing",
+  title: "Scrutix-XP — Logistics Invoice Auditing",
   description: "Automated logistics invoice auditing for D2C brands",
 };
 
