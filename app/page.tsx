@@ -746,16 +746,24 @@ export default function Home() {
                 boxShadow: "0 0 12px rgba(239,68,68,0.5)",
               }}
             />
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/scrutixxp-logo.png"
-              alt="Scrutix"
-              style={{
-                height: "58px",
-                width: "auto",
-                filter: "brightness(0) invert(1)",
-              }}
-            />
+            {/*
+              The PNG is a 1:1 square canvas — the text occupies ~43-60% vertically.
+              We render at 280px and clip with overflow:hidden to show only the text band.
+            */}
+            <div style={{ height: "54px", overflow: "hidden", flexShrink: 0 }}>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src="/scrutixxp-logo.png"
+                alt="Scrutix"
+                style={{
+                  height: "280px",
+                  width: "auto",
+                  marginTop: "-114px",
+                  display: "block",
+                  filter: "invert(1)",
+                }}
+              />
+            </div>
           </div>
           <p className="text-zinc-500 text-sm pl-5">
             Automated logistics invoice auditing for D2C brands
