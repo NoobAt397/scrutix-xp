@@ -34,6 +34,7 @@ import {
   buildAuditRecord,
   saveAuditRecord,
   loadAuditHistory,
+  clearAuditHistory,
   type AuditRecord,
 } from "@/lib/audit-history"
 import AnalyticsDashboard from "@/components/AnalyticsDashboard"
@@ -1486,11 +1487,11 @@ export default function Home() {
               records={auditHistory}
               weightData={weightData}
               onClear={() => {
+                clearAuditHistory()
                 clearWeightData()
-                setWeightData([])
                 setAuditHistory([])
-                clearCustomContracts()
-                setCustomContracts({})
+                setWeightData([])
+                toast({ title: "Audit history cleared." })
               }}
             />
           </>

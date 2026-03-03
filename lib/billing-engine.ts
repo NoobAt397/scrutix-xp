@@ -245,11 +245,21 @@ export function analyzeInvoice(
   for (const row of csvData) {
     const awb:               string  = String(row.AWB ?? "")
     const orderType:         string  = String(row.OrderType ?? "")
-    const billedWeight:      number  = Number(row.BilledWeight)
-    const actualWeight:      number  = Number(row.ActualWeight)
     const billedZone:        string  = String(row.BilledZone ?? "")
     const actualZone:        string  = String(row.ActualZone ?? "")
     const totalBilledAmount: number  = Number(row.TotalBilledAmount)
+
+    // ── Courier's claims (display only — never used in cost calculation) ────
+    // billedWeight is what the courier says they charged for.
+    // It must only be used to label issue types and populate the breakdown
+    // display. It must never be fed into the slab or freight calculation.
+    const billedWeight: number = Number(row.BilledWeight) || 0
+
+    // ── Our independent inputs ──────────────────────────────────────────────
+    // deadWeight is the physical/declared weight of the parcel (kg).
+    // It comes from the ActualWeight column — NOT from BilledWeight or any
+    // "Charged Weight" / "Chargeable Weight" column. Those map to BilledWeight.
+    const deadWeight: number = Number(row.ActualWeight) || 0
 
     const length    = row.Length       != null ? Number(row.Length)       : undefined
     const width     = row.Width        != null ? Number(row.Width)        : undefined
@@ -273,9 +283,12 @@ export function analyzeInvoice(
     }
     seenAWBs.add(awb)
 
-    // ── Chargeable weight ───────────────────────────────────────────────────
+    // ── Independently derived chargeable weight ─────────────────────────────
+    // Uses deadWeight (physical) + dimensions only. billedWeight plays no part.
+    // correctChargeableWeight = max(deadWeight, volumetricWeight)
+    // volumetricWeight = L × W × H / 5000  (standard Indian courier divisor)
     const { chargeableWeight, volumetricWeight } = calculateChargeableWeight(
-      actualWeight, length, width, height
+      deadWeight, length, width, height
     )
 
     // ── Zone determination ──────────────────────────────────────────────────
@@ -377,7 +390,7 @@ export function analyzeInvoice(
       pincodeDerivedZone,
       zoneMismatch,
       billedWeight,
-      actualWeight,
+      actualWeight: deadWeight,
       volumetricWeight,
       chargeableWeight,
       weightOvercharge,

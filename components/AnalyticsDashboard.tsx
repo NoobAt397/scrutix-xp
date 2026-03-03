@@ -108,6 +108,7 @@ interface Props {
 
 export default function AnalyticsDashboard({ records, weightData, onClear }: Props) {
   const [dateRange, setDateRange] = useState<DateRange>("all")
+  const [confirmClear, setConfirmClear] = useState(false)
 
   // ── Filter + sort records ───────────────────────────────────────────────────
   const filtered = useMemo(() => {
@@ -263,14 +264,43 @@ export default function AnalyticsDashboard({ records, weightData, onClear }: Pro
           </div>
 
           <button
-            onClick={() => { clearAuditHistory(); onClear() }}
-            title="Clear all audit history"
-            className="p-2 text-zinc-700 hover:text-red-500 transition-colors rounded-md border border-zinc-800/60 hover:border-red-900/40"
+            onClick={() => setConfirmClear(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium text-red-500/70 border border-red-900/30 rounded-md hover:text-red-400 hover:border-red-700/50 transition-colors"
           >
-            <Trash2 size={13} />
+            <Trash2 size={11} />
+            Clear History
           </button>
         </div>
       </div>
+
+      {/* ── Confirmation panel ── */}
+      {confirmClear && (
+        <div
+          className="rounded-md border px-4 py-3 flex flex-col gap-2"
+          style={{ borderColor: "rgba(220,38,38,0.35)", background: "rgba(220,38,38,0.06)" }}
+        >
+          <p className="text-xs text-red-300/80 leading-relaxed">
+            This will permanently delete all audit history from this browser. This cannot be undone.
+          </p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                onClear()
+                setConfirmClear(false)
+              }}
+              className="px-3 py-1 text-[11px] font-medium rounded border bg-red-900/30 border-red-700/50 text-red-300 hover:bg-red-900/50 transition-colors"
+            >
+              Confirm — Delete All
+            </button>
+            <button
+              onClick={() => setConfirmClear(false)}
+              className="px-3 py-1 text-[11px] font-medium rounded border border-zinc-700/50 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Supporting KPI cards ── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
