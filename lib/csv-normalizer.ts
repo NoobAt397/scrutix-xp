@@ -38,8 +38,12 @@ export function normalizeWeight(raw: unknown): number {
   if (kgMatch) return parseFloat(kgMatch[1])
 
   // plain numeric string
+  // Apply the same gram-detection threshold as the number branch above:
+  // values > 200 are assumed to be in grams (e.g. "500" from a "Grams" column)
+  // and are converted to kg. Values ≤ 200 are assumed to already be in kg.
   const n = parseFloat(str)
-  return isNaN(n) ? 0 : n
+  if (isNaN(n)) return 0
+  return n > 200 ? n / 1000 : n
 }
 
 // ── Dimension ─────────────────────────────────────────────────────────────────

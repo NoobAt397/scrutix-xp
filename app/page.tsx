@@ -830,10 +830,7 @@ export default function Home() {
                       : "Click to upload Invoice"}
                   </p>
                   <p className="text-[11px] text-zinc-600">
-                    CSV, XLSX, PDF · comma / semicolon / tab delimiters · multi-row headers auto-skipped
-                  </p>
-                  <p className="text-[11px] text-zinc-700 mt-0.5">
-                    Columns auto-detected · scanned PDFs parsed by Gemini AI
+                    CSV, XLSX, PDF · comma / semicolon / tab delimiters · columns auto-detected
                   </p>
                 </div>
                 <Input
@@ -855,6 +852,31 @@ export default function Home() {
                   Processed: <span className="text-zinc-400 font-mono">{fileName}</span>
                 </p>
               )}
+
+              {/* ── Run Audit CTA — prominent after CSV/XLSX is loaded ── */}
+              {fileName && !isProcessing && !isPdfExtracting && lastMappedRows.length > 0 && (
+                <button
+                  onClick={() => {
+                    setIsProcessing(true)
+                    setAnalysisResults(null)
+                    setAnalysisWarnings([])
+                    setUnknownProviderWarnings([])
+                    runAnalysis(lastMappedRows)
+                  }}
+                  className="w-full py-3 rounded-md text-sm font-semibold tracking-wide transition-all duration-200 hover:opacity-90 active:scale-[0.99] flex items-center justify-center gap-2"
+                  style={{
+                    background: "linear-gradient(135deg, #16a34a 0%, #15803d 100%)",
+                    color: "#ffffff",
+                    boxShadow: "0 0 20px rgba(22,163,74,0.35), 0 2px 8px rgba(0,0,0,0.4)",
+                    border: "1px solid rgba(22,163,74,0.5)",
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                  Run Audit
+                </button>
+              )}
             </CardContent>
           </Card>
 
@@ -869,33 +891,25 @@ export default function Home() {
                   <CardTitle className="text-[11px] text-zinc-500 font-semibold uppercase tracking-widest">
                     Active Contract Rules
                   </CardTitle>
-                  {/* AI badge — changes colour based on extraction state */}
-                  <span
-                    className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm border text-[10px] font-medium tracking-wide transition-all duration-300"
-                    style={
-                      isExtracting
-                        ? { background: "rgba(217,119,6,0.12)", borderColor: "rgba(217,119,6,0.35)", color: "rgb(252,211,77)" }
-                        : extractedContract
-                        ? { background: "rgba(22,163,74,0.12)", borderColor: "rgba(22,163,74,0.35)", color: "rgb(134,239,172)" }
-                        : { background: "rgba(124,58,237,0.12)", borderColor: "rgba(124,58,237,0.35)", color: "rgb(167,139,250)" }
-                    }
-                  >
+                  {/* AI badge — only visible while extracting or after successful extraction */}
+                  {(isExtracting || extractedContract) && (
                     <span
-                      className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isExtracting ? "animate-ping" : ""}`}
-                      style={{
-                        backgroundColor: isExtracting
-                          ? "rgb(252,211,77)"
-                          : extractedContract
-                          ? "rgb(134,239,172)"
-                          : "rgb(167,139,250)",
-                      }}
-                    />
-                    {isExtracting
-                      ? "Extracting PDF…"
-                      : extractedContract
-                      ? "✓ AI Extracted"
-                      : "AI Extracted from PDF"}
-                  </span>
+                      className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-sm border text-[10px] font-medium tracking-wide transition-all duration-300"
+                      style={
+                        isExtracting
+                          ? { background: "rgba(217,119,6,0.12)", borderColor: "rgba(217,119,6,0.35)", color: "rgb(252,211,77)" }
+                          : { background: "rgba(22,163,74,0.12)", borderColor: "rgba(22,163,74,0.35)", color: "rgb(134,239,172)" }
+                      }
+                    >
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${isExtracting ? "animate-ping" : ""}`}
+                        style={{
+                          backgroundColor: isExtracting ? "rgb(252,211,77)" : "rgb(134,239,172)",
+                        }}
+                      />
+                      {isExtracting ? "Extracting PDF…" : "✓ AI Extracted"}
+                    </span>
+                  )}
                 </div>
                 <ChevronDown
                   className="mt-0.5 flex-shrink-0 text-zinc-600 transition-transform duration-200 group-hover:text-zinc-400"
@@ -934,7 +948,7 @@ export default function Home() {
                           style={
                             selectedProvider === name
                               ? { background: "rgba(220,38,38,0.2)", color: "rgb(252,165,165)", border: "1px solid rgba(220,38,38,0.45)" }
-                              : { background: "transparent", color: "rgb(82,82,91)", border: "1px solid rgba(63,63,70,0.6)" }
+                              : { background: "transparent", color: "rgb(161,161,170)", border: "1px solid rgba(113,113,122,0.55)" }
                           }
                         >
                           {name}
@@ -1019,7 +1033,7 @@ export default function Home() {
                               : { color: "rgb(251,191,36)", borderColor: "rgba(217,119,6,0.35)", background: "rgba(217,119,6,0.08)" }
                           }
                         >
-                          {extractedContract ? "from contract" : "estimated"}
+                          {extractedContract ? "configured" : "not configured"}
                         </span>
                       )}
                     </div>
